@@ -1,0 +1,447 @@
+﻿--Синхронизация справочников из файлов xml в Oralce БД
+
+create or replace PROCEDURE VK_SYNC_MAIN AS --Запускаемая по расписанию процедура
+BEGIN
+VK_FILES_LOADING; --Загружает новые файлы в базу
+VK_XML_LOADING2; --Разбирает xml/создает копию внешнего справочника
+VK_CUST_UPDATE; --Обновляет данные контрагентов в этой БД значениями из внешеней.
+END VK_SYNC_MAIN;
+
+
+create or replace procedure vk_files_loading --загрузка в базу всех новых xml файлов
+as
+      cursor vk_dirlist_c is 
+      select d.filename from dir_list d 
+      left outer join VK_filehistory v on d.filename=v.filename
+      where v.filename is null;
+      p_file_name vk_dirlist_c%rowtype;
+      
+  begin
+      delete from dir_list;
+      delete from vk_xmlfiles;
+      commit;
+      get_dir_list('/share');
+      commit;
+      open vk_dirlist_c;
+      loop
+          fetch  vk_dirlist_c into p_file_name;
+          exit when vk_dirlist_c%NOTFOUND; 
+             vk_file_load(p_file_name.filename);
+      end loop;
+  close vk_dirlist_c;
+end;
+
+create or replace procedure vk_file_load (filename in varchar2) --загрузка каждого отдельного файла
+as
+      l_blob    blob;
+      l_bfile   bfile;
+      p_dir_name varchar2(20);
+      DL timestamp;
+      a1 NUMBER;
+      a2 VARCHAR2(255);
+begin
+      p_dir_name:='XMLTEST';
+      SELECT cast(SYSDATE as timestamp) into DL FROM DUAL;
+      insert into vk_xmlfiles values ( vk_blob_seq.nextval, empty_blob(), filename, DL) returning theBlob into l_Blob;
+      l_bfile := bfilename( p_dir_name, filename );
+      dbms_lob.fileopen( l_bfile );
+      dbms_lob.loadfromfile( l_blob, l_bfile,dbms_lob.getlength( l_bfile ) );
+      dbms_lob.fileclose( l_bfile );
+      insert into VK_FILEHISTORY (FILENAME, LOADTIME) Values (filename,DL);
+      commit;
+EXCEPTION
+  WHEN OTHERS THEN
+    rollback;
+    a1:=SQLCODE;
+    a2:=SQLERRM;
+    insert into VK_ERRORLOG (ORACODE, TEXT, DTIME,filename)  
+    VALUES('file_load_fail '|| TO_CHAR(a1) , a2, DL,filename);
+    commit;
+end;
+
+create or replace procedure vk_xml_loading2 -- разбор всех xml файлов
+as
+      cursor vk_xmlfiles is select id from VK_XMLFiles;
+      curs vk_xmlfiles%rowtype;   
+      
+  begin
+      open vk_xmlfiles;
+     -- delete from  VK_DMECUST_CATALOG ; commit;
+      loop
+         fetch vk_xmlfiles into curs;
+         exit when vk_xmlfiles%NOTFOUND;
+         vk_xml_parce2(curs.id);
+      end loop;
+      commit;
+  close vk_xmlfiles;
+end;
+
+create or replace procedure vk_xml_loading -- разбор одного xml файла id=145
+as
+      cursor vk_xmllist is select id from VK_XMLFiles where id=145;
+      curs vk_xmllist%rowtype;   
+      
+  begin
+     delete from  VK_XMLDATA_BUFF;
+      commit;
+      open vk_xmllist;
+      loop
+         fetch vk_xmllist into curs;
+         exit when vk_xmllist%NOTFOUND;
+         vk_xml_parce(curs.id);
+      end loop;
+  close vk_xmllist;
+end;
+
+create or replace procedure vk_xml_parce2 (idf in number) -- парсер xml
+as
+     a1 NUMBER;
+     a2 VARCHAR2(255);      
+  begin
+     
+     delete from VK_DMECUST_CATALOG where unid in (
+     select 
+     extractValue(value(t),'ns0:CONTRAGENT_COMPANIESType/ns0:IDLN/text()',  'xmlns:ns0="http://www.ibm.com/maximo"' ) as unid
+    from table(
+       select XmlSequence(XmlType(replace(VK_clobfromblob(theblob),'ns0:ArrayOfCONTRAGENT_COMPANIESType','ArrayOfCONTRAGENT_COMPANIESType')).extract(
+       'ArrayOfCONTRAGENT_COMPANIESType/ns0:CONTRAGENT_COMPANIESType','xmlns:ns0="http://www.ibm.com/maximo"'))
+       from vk_xmlfiles where id = idf )t
+       where 
+       extractValue(value(t),'ns0:CONTRAGENT_COMPANIESType/ns0:TYPE/text()',  'xmlns:ns0="http://www.ibm.com/maximo"' ) ='C'
+     );
+
+    
+     insert into VK_DMECUST_CATALOG_temp (UNID, NAME, ADRESS,   INN,  KPP,  EMAIL,  PHONE,  FAX) 
+select 
+     extractValue(value(t),'ns0:CONTRAGENT_COMPANIESType/ns0:IDLN/text()',  'xmlns:ns0="http://www.ibm.com/maximo"' ) as unid
+    ,extractValue(value(t),'ns0:CONTRAGENT_COMPANIESType/ns0:NAME/text()',  'xmlns:ns0="http://www.ibm.com/maximo"' ) as Name
+    ,case 
+    when extractValue(value(t),'ns0:CONTRAGENT_COMPANIESType/ns0:ADDRESS3/text()',  'xmlns:ns0="http://www.ibm.com/maximo"' ) is null then ''
+    else extractValue(value(t),'ns0:CONTRAGENT_COMPANIESType/ns0:ADDRESS3/text()',  'xmlns:ns0="http://www.ibm.com/maximo"' ) ||' область '
+    end 
+    || case 
+    when extractValue(value(t),'ns0:CONTRAGENT_COMPANIESType/ns0:ADDRESS2/text()',  'xmlns:ns0="http://www.ibm.com/maximo"' ) is null then ''
+    else 'город ' || extractValue(value(t),'ns0:CONTRAGENT_COMPANIESType/ns0:ADDRESS2/text()',  'xmlns:ns0="http://www.ibm.com/maximo"' )  || ' '
+    end 
+    ||
+    extractValue(value(t),'ns0:CONTRAGENT_COMPANIESType/ns0:ADDRESS1/text()',  'xmlns:ns0="http://www.ibm.com/maximo"' )
+    as Address
+    ,extractValue(value(t),'ns0:CONTRAGENT_COMPANIESType/ns0:REGISTRATION1/text()',  'xmlns:ns0="http://www.ibm.com/maximo"' ) as Inn
+    ,extractValue(value(t),'ns0:CONTRAGENT_COMPANIESType/ns0:REGISTRATION2/text()',  'xmlns:ns0="http://www.ibm.com/maximo"' ) as Kpp
+    ,extractValue(value(t),'ns0:CONTRAGENT_COMPANIESType/ns0:EMAIL/text()',  'xmlns:ns0="http://www.ibm.com/maximo"' ) as email
+    ,extractValue(value(t),'ns0:CONTRAGENT_COMPANIESType/ns0:PHONE/text()',  'xmlns:ns0="http://www.ibm.com/maximo"' ) as Phone
+    ,extractValue(value(t),'ns0:CONTRAGENT_COMPANIESType/ns0:FAX/text()',  'xmlns:ns0="http://www.ibm.com/maximo"' ) as Fax
+    from table(
+       select XmlSequence(XmlType(replace(VK_clobfromblob(theblob),'ns0:ArrayOfCONTRAGENT_COMPANIESType','ArrayOfCONTRAGENT_COMPANIESType')).extract(
+       'ArrayOfCONTRAGENT_COMPANIESType/ns0:CONTRAGENT_COMPANIESType','xmlns:ns0="http://www.ibm.com/maximo"'))
+       from vk_xmlfiles where id = idf )t
+       where 
+       extractValue(value(t),'ns0:CONTRAGENT_COMPANIESType/ns0:TYPE/text()',  'xmlns:ns0="http://www.ibm.com/maximo"' ) ='C';
+       
+       insert into VK_DMECUST_CATALOG (UNID,  NAME,  ADRESS,  INN,  KPP,  EMAIL,  PHONE,  FAX,  FILENAME,  DTIME)
+       select UNID,  NAME,  ADRESS,  INN,  KPP,  EMAIL,  PHONE,  FAX , FILENAME, LOADTIME
+       FROM VK_DMECUST_CATALOG_temp, VK_XMLFILES where id=idf;    
+       
+       delete from VK_XMLFILES where id=idf;
+       commit;
+        
+EXCEPTION
+  WHEN OTHERS THEN
+    rollback;
+    a1:=SQLCODE;
+    a2:=SQLERRM;
+    insert into VK_ERRORLOG (ORACODE, TEXT, DTIME,filename)  
+    select 'xml_parce_fail '|| TO_CHAR(a1), a2, LOADTIME,filename 
+    from VK_XMLFILES
+    where id=idf;
+    commit;
+end;
+
+
+create or replace procedure vk_xml_parce (idf in number) ---парсер xml
+as
+     a1 NUMBER;
+     a2 VARCHAR2(255);      
+  begin
+      
+       insert into VK_XMLDATA_TEMP(UNID,FDC) 
+       select
+       extract (value(d1) ,'/Document/@UNID').getStringVal() as UNID,
+       TO_CLOB(extract (value(d1) ,'/Document')) as FDC
+       from table(
+       select XmlSequence(XmlType(VK_clobfromblob(theblob)).extract('Document_LN_1C/Document') )
+       from vk_xmlfiles where id = idf
+       ) d1;
+        
+        
+       insert into VK_XMLDATA_BUFF (UNID, FDC, FILENAME, LOADTIME)
+       select UNID, FDC, FILENAME, LOADTIME 
+       from VK_XMLDATA_TEMP, VK_XMLFILES
+       where id=idf;
+
+       commit;
+EXCEPTION
+  WHEN OTHERS THEN
+    rollback;
+    a1:=SQLCODE;
+    a2:=SQLERRM;
+    insert into VK_ERRORLOG (ORACODE, TEXT, DTIME)  
+    select 'xml_parce_fail '|| TO_CHAR(a1), FILENAME||' '||UNID|| ' ' || a2, LOADTIME 
+    from VK_XMLDATA_TEMP, VK_XMLFILES
+    where id=idf;
+    commit;
+end;
+
+
+
+
+  CREATE TABLE "BILLING"."VK_BM_CUSTOMER_CONTACT_BKP" 
+   (	"CUSTOMER_CONTACT_ID" NUMBER, 
+	"CUSTOMER_ID" NUMBER, 
+	"CONTACT_DICT_ID" NUMBER, 
+	"VALUE" VARCHAR2(255 CHAR), 
+	"DTIME" TIMESTAMP (6)
+   ) SEGMENT CREATION IMMEDIATE 
+  PCTFREE 10 PCTUSED 40 INITRANS 1 MAXTRANS 255 
+ NOCOMPRESS LOGGING
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "BM_DATA" ;
+
+  
+  CREATE TABLE "BILLING"."VK_COLUMN_COMPARE" 
+   (	"CONTACT_DICT_ID" NUMBER, 
+	"MNEMONIC" VARCHAR2(255 BYTE), 
+	"DME_PROPERTYEN" VARCHAR2(255 BYTE), 
+	"NAME" VARCHAR2(255 BYTE), 
+	"COMRU" VARCHAR2(255 BYTE), 
+	"DME_PROPERTY2" VARCHAR2(255 BYTE)
+   ) SEGMENT CREATION IMMEDIATE 
+  PCTFREE 10 PCTUSED 40 INITRANS 1 MAXTRANS 255 
+ NOCOMPRESS LOGGING
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "BM_DATA" ;
+
+  
+  
+  CREATE TABLE "BILLING"."VK_DMECUST_CATALOG" 
+   (	"UNID" VARCHAR2(50 BYTE), 
+	"NAME" VARCHAR2(1000 BYTE), 
+	"ADRESS" VARCHAR2(1000 BYTE), 
+	"INN" VARCHAR2(1000 BYTE), 
+	"KPP" VARCHAR2(1000 BYTE), 
+	"EMAIL" VARCHAR2(1500 BYTE), 
+	"PHONE" VARCHAR2(1000 BYTE), 
+	"FAX" VARCHAR2(1000 BYTE), 
+	"FILENAME" VARCHAR2(1000 BYTE), 
+	"DTIME" TIMESTAMP (6)
+   ) SEGMENT CREATION IMMEDIATE 
+  PCTFREE 10 PCTUSED 40 INITRANS 1 MAXTRANS 255 
+ NOCOMPRESS LOGGING
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "BM_DATA" ;
+
+  
+  
+  CREATE GLOBAL TEMPORARY TABLE "BILLING"."VK_DMECUST_CATALOG_TEMP" 
+   (	"UNID" VARCHAR2(50 BYTE), 
+	"NAME" VARCHAR2(1000 BYTE), 
+	"ADRESS" VARCHAR2(1000 BYTE), 
+	"INN" VARCHAR2(1000 BYTE), 
+	"KPP" VARCHAR2(1000 BYTE), 
+	"EMAIL" VARCHAR2(1500 BYTE), 
+	"PHONE" VARCHAR2(1000 BYTE), 
+	"FAX" VARCHAR2(1000 BYTE)
+   ) ON COMMIT DELETE ROWS ;
+
+   
+   
+  CREATE TABLE "BILLING"."VK_ERRORLOG" 
+   (	"ID" NUMBER(38,0), 
+	"ORACODE" VARCHAR2(255 BYTE), 
+	"TEXT" VARCHAR2(255 BYTE), 
+	"DTIME" TIMESTAMP (6), 
+	"FILENAME" VARCHAR2(50 BYTE)
+   ) SEGMENT CREATION IMMEDIATE 
+  PCTFREE 10 PCTUSED 40 INITRANS 1 MAXTRANS 255 
+ NOCOMPRESS LOGGING
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "BM_DATA" ;
+
+  CREATE OR REPLACE TRIGGER "BILLING"."VK_ERRORLOG_AUOTO_INC" 
+   before insert on "BILLING"."VK_ERRORLOG" 
+   for each row 
+begin  
+   if inserting then 
+      if :NEW."ID" is null then 
+         select VK_SEQ1.nextval into :NEW."ID" from dual; 
+      end if; 
+   end if; 
+end;
+
+/
+ALTER TRIGGER "BILLING"."VK_ERRORLOG_AUOTO_INC" ENABLE;
+
+
+  CREATE TABLE "BILLING"."VK_FILE_LIST" 
+   (	"FILENAME" VARCHAR2(255 BYTE)
+   ) SEGMENT CREATION DEFERRED 
+  PCTFREE 10 PCTUSED 40 INITRANS 1 MAXTRANS 255 
+ NOCOMPRESS LOGGING
+  TABLESPACE "BM_DATA" ;
+
+  
+  
+  CREATE TABLE "BILLING"."VK_FILEHISTORY" 
+   (	"FILENAME" VARCHAR2(255 BYTE), 
+	"LOADTIME" TIMESTAMP (6)
+   ) SEGMENT CREATION IMMEDIATE 
+  PCTFREE 10 PCTUSED 40 INITRANS 1 MAXTRANS 255 
+ NOCOMPRESS LOGGING
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "BM_DATA" ;
+
+  CREATE INDEX "BILLING"."INDEX1" ON "BILLING"."VK_FILEHISTORY" ("FILENAME") 
+  PCTFREE 10 INITRANS 2 MAXTRANS 255 COMPUTE STATISTICS 
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "BM_DATA" ;
+
+  
+  
+  CREATE TABLE "BILLING"."VK_XMLCUSTOMERS" 
+   (	"ID" NUMBER(*,0), 
+	"UNID" VARCHAR2(255 BYTE), 
+	"PROPERTYEN" VARCHAR2(255 BYTE), 
+	"PROPERTYRU" VARCHAR2(255 BYTE), 
+	"DATA" VARCHAR2(2000 BYTE), 
+	"TYPE" VARCHAR2(50 BYTE)
+   ) SEGMENT CREATION IMMEDIATE 
+  PCTFREE 10 PCTUSED 40 INITRANS 1 MAXTRANS 255 
+ NOCOMPRESS LOGGING
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "BM_DATA" ;
+
+  CREATE OR REPLACE TRIGGER "BILLING"."VK_XMLCUST_AUTO_INC" before insert on "BILLING"."VK_XMLCUSTOMERS" 
+   for each row 
+begin  
+   if inserting then 
+      if :NEW."ID" is null then 
+         select VK_XMLCUST_SEQ.nextval into :NEW."ID" from dual; 
+      end if; 
+   end if; 
+end;
+
+/
+ALTER TRIGGER "BILLING"."VK_XMLCUST_AUTO_INC" ENABLE;
+
+
+
+  CREATE TABLE "BILLING"."VK_XMLDATA" 
+   (	"ID" NUMBER(38,0) NOT NULL ENABLE, 
+	"UNID" VARCHAR2(100 BYTE), 
+	"FDC" CLOB, 
+	"FILENAME" VARCHAR2(255 BYTE), 
+	"LOADTIME" TIMESTAMP (6), 
+	 CONSTRAINT "VK_DEMO2_PK" PRIMARY KEY ("ID")
+  USING INDEX PCTFREE 10 INITRANS 2 MAXTRANS 255 COMPUTE STATISTICS 
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "BM_DATA"  ENABLE
+   ) SEGMENT CREATION IMMEDIATE 
+  PCTFREE 10 PCTUSED 40 INITRANS 1 MAXTRANS 255 
+ NOCOMPRESS LOGGING
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "BM_DATA" 
+ LOB ("FDC") STORE AS BASICFILE (
+  TABLESPACE "BM_DATA" ENABLE STORAGE IN ROW CHUNK 8192 RETENTION 
+  NOCACHE LOGGING 
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)) ;
+
+  CREATE OR REPLACE TRIGGER "BILLING"."VK_XMLDATA_AUTO_INC" BEFORE INSERT ON VK_XMLDATA
+FOR EACH ROW
+BEGIN
+ SELECT VK_seq1.NEXTVAL
+  INTO   :new.id
+  FROM   dual;
+END;
+/
+ALTER TRIGGER "BILLING"."VK_XMLDATA_AUTO_INC" ENABLE;
+
+
+
+  CREATE TABLE "BILLING"."VK_XMLDATA_BUFF" 
+   (	"UNID" VARCHAR2(100 BYTE), 
+	"FDC" CLOB, 
+	"FILENAME" VARCHAR2(255 BYTE), 
+	"LOADTIME" TIMESTAMP (6)
+   ) SEGMENT CREATION IMMEDIATE 
+  PCTFREE 10 PCTUSED 40 INITRANS 1 MAXTRANS 255 
+ NOCOMPRESS LOGGING
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "BM_DATA" 
+ LOB ("FDC") STORE AS BASICFILE (
+  TABLESPACE "BM_DATA" ENABLE STORAGE IN ROW CHUNK 8192 RETENTION 
+  NOCACHE LOGGING 
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)) ;
+
+  
+  
+  CREATE GLOBAL TEMPORARY TABLE "BILLING"."VK_XMLDATA_TEMP" 
+   (	"UNID" VARCHAR2(100 BYTE), 
+	"FDC" CLOB
+   ) ON COMMIT DELETE ROWS ;
+
+   
+   
+  CREATE TABLE "BILLING"."VK_XMLFILES" 
+   (	"ID" NUMBER(*,0), 
+	"THEBLOB" BLOB, 
+	"FILENAME" VARCHAR2(255 BYTE), 
+	"LOADTIME" TIMESTAMP (6), 
+	 PRIMARY KEY ("ID")
+  USING INDEX PCTFREE 10 INITRANS 2 MAXTRANS 255 COMPUTE STATISTICS 
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "BM_DATA"  ENABLE
+   ) SEGMENT CREATION IMMEDIATE 
+  PCTFREE 10 PCTUSED 40 INITRANS 1 MAXTRANS 255 
+ NOCOMPRESS LOGGING
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "BM_DATA" 
+ LOB ("THEBLOB") STORE AS BASICFILE (
+  TABLESPACE "BM_DATA" ENABLE STORAGE IN ROW CHUNK 8192 RETENTION 
+  NOCACHE LOGGING 
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)) ;
+
+  
+  create or replace procedure get_dir_list(p_directory in varchar2)
+    as language java
+    name 'DirList.getList(java.lang.String)';
+   
